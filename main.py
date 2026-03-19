@@ -56,8 +56,9 @@ async def get_user_routes(user_id: int):
         ) as cursor:
             return await cursor.fetchall()
 
-# ================= ФОНОВИЙ РОБІТНИК (DISPATCHER) =================
+# ================= ФОНОВІ РОБІТНИКИ =================
 async def ticket_worker(bot_instance: Bot):
+    """Фоновий процес для розсилки та видалення квитків"""
     while True:
         try:
             now_ts = int(datetime.now().timestamp())
@@ -104,9 +105,75 @@ async def ticket_worker(bot_instance: Bot):
 
                 await db.commit()
         except Exception as e:
-            logging.error(f"Помилка у фоновому робітнику: {e}")
+            logging.error(f"Помилка у ticket_worker: {e}")
 
         await asyncio.sleep(20)
+
+async def schedule_update_worker(bot_instance: Bot):
+    """Фоновий процес для моніторингу змін у розкладі кожні 5 хвилин"""
+    while True:
+        await asyncio.sleep(300) # 5 хвилин
+        try:
+            today = datetime.now(timezone.utc).astimezone().date()
+            dates_to_check = {today.isoformat(), (today + timedelta(days=1)).isoformat()}
+            dates_to_check.update(date_str for date_str, _ in active_messages.keys())
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                for date_str in dates_to_check:
+                    target_date = datetime.fromisoformat(date_str).date()
+                    loop = asyncio.get_running_loop()
+                    routes_to_umea, routes_to_vns = await asyncio.gather(
+                        loop.run_in_executor(None, fetch_trains, target_date, "to_umea"),
+                        loop.run_in_executor(None, fetch_trains, target_date, "to_vns")
+                    )
+
+                    # Маппінг актуального часу для кожного потяга
+                    train_updates = {}
+                    for r in routes_to_umea + routes_to_vns:
+                        train_updates[r["id"]] = int(r["dep_time"].timestamp())
+
+                    async with db.execute("SELECT rowid, train_id, user_id, dep_ts FROM bookings WHERE date = ?", (date_str,)) as cursor:
+                        bookings = await cursor.fetchall()
+
+                    for b_rowid, t_id, u_id, old_dep_ts in bookings:
+                        new_dep_ts = train_updates.get(t_id)
+                        
+                        # Якщо розклад змістився
+                        if new_dep_ts and new_dep_ts != old_dep_ts:
+                            await db.execute("UPDATE bookings SET dep_ts = ? WHERE rowid = ?", (new_dep_ts, b_rowid))
+                            
+                            old_time_str = datetime.fromtimestamp(old_dep_ts).astimezone().strftime("%H:%M")
+                            new_time_str = datetime.fromtimestamp(new_dep_ts).astimezone().strftime("%H:%M")
+                            
+                            try:
+                                await bot_instance.send_message(
+                                    u_id,
+                                    f"⚠️ **Увага! Зміни у розкладі.**\nЧас відправлення твого потяга **{t_id}** на {date_str} змінився!\n"
+                                    f"Було: {old_time_str} ➡️ **Стало: {new_time_str}**",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception: pass
+
+                    await db.commit()
+
+                    # Оновлюємо візуальне відображення для всіх відкритих клавіатур
+                    for cache_key in list(active_messages.keys()):
+                        if cache_key[0] == date_str:
+                            route_id = cache_key[1]
+                            markup = await build_dual_schedule_keyboard(routes_to_umea, routes_to_vns, date_str, route_id)
+                            dead_messages = set()
+                            for chat_id, msg_id in active_messages.get(cache_key, []):
+                                try:
+                                    await bot_instance.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=markup)
+                                except Exception as e:
+                                    if "message is not modified" not in str(e).lower(): 
+                                        dead_messages.add((chat_id, msg_id))
+
+                            for dead in dead_messages:
+                                active_messages[cache_key].discard(dead)
+        except Exception as e:
+            logging.error(f"Помилка в schedule_update_worker: {e}")
+
 
 # ================= ЛОГІКА API Trafikverket =================
 def fetch_trains(target_date: datetime.date, direction: str):
@@ -236,7 +303,6 @@ async def send_groups_list(chat_id: int, user_id: int):
         invite_link = f"https://t.me/{bot_info.username}?start=join_{rid}"
         text += f"🔹 **{rname}**\n🎫 Дійсних квитків: {valid_tickets}\n👤 Учасники: {', '.join(members)}\n🔗 Запросити: `{invite_link}`\n\n"
         
-        # Якщо ти власник - дві кнопки управління, якщо ні - тільки вихід
         if owner_id == user_id:
             kb_builder.append([
                 InlineKeyboardButton(text=f"⚙️ Учасники «{rname[:10]}»", callback_data=f"manage_grp:{rid}"),
@@ -296,7 +362,6 @@ async def manage_group_callback(callback: CallbackQuery):
                 return await callback.answer("Тільки власник може керувати групою!", show_alert=True)
             route_name = row[0]
         
-        # Отримуємо всіх учасників КРІМ власника
         async with db.execute("SELECT u.user_id, u.full_name FROM route_members rm JOIN users u ON rm.user_id = u.user_id WHERE rm.route_id = ? AND rm.user_id != ?", (route_id, user_id)) as cursor:
             members = await cursor.fetchall()
 
@@ -312,7 +377,6 @@ async def manage_group_callback(callback: CallbackQuery):
         kb_builder.append([InlineKeyboardButton(text=f"❌ Видалити: {m_name}", callback_data=f"kick_usr:{route_id}:{m_id}")])
     
     kb_builder.append([InlineKeyboardButton(text="🔙 Назад до груп", callback_data="back_to_grps")])
-    
     text = f"⚙️ **Керування учасниками групи «{route_name}»**\n\nОбери, кого хочеш видалити з групи:"
     
     try:
@@ -321,8 +385,7 @@ async def manage_group_callback(callback: CallbackQuery):
         else:
             await callback.message.delete()
             await callback.message.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_builder))
-    except Exception:
-        pass
+    except Exception: pass
 
 @dp.callback_query(F.data.startswith("kick_usr:"))
 async def kick_user_callback(callback: CallbackQuery):
@@ -336,15 +399,12 @@ async def kick_user_callback(callback: CallbackQuery):
             if not row or row[0] != user_id:
                 return await callback.answer("Помилка доступу!", show_alert=True)
         
-        # Видалення юзера та всіх його даних із цієї групи
         await db.execute("DELETE FROM route_members WHERE route_id = ? AND user_id = ?", (route_id, target_user_id))
         await db.execute("DELETE FROM bookings WHERE route_id = ? AND user_id = ?", (route_id, target_user_id))
         await db.execute("DELETE FROM tickets WHERE route_id = ? AND user_id = ?", (route_id, target_user_id))
         await db.commit()
         
     await callback.answer("✅ Учасника успішно видалено!")
-    
-    # Оновлюємо меню керування
     callback.data = f"manage_grp:{route_id}"
     await manage_group_callback(callback)
 
@@ -602,6 +662,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     asyncio.create_task(ticket_worker(bot))
+    asyncio.create_task(schedule_update_worker(bot))
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
