@@ -31,9 +31,12 @@ last_user_messages = {}
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-class TicketState(StatesGroup):
+# Розширена машина станів
+class BotState(StatesGroup):
     waiting_for_photo = State()
     waiting_for_date = State()
+    waiting_for_user_name = State()
+    waiting_for_group_name = State()
 
 # ================= БАЗА ДАНИХ ТА ХЕЛПЕРИ =================
 async def init_db():
@@ -58,7 +61,6 @@ async def get_user_routes(user_id: int):
 
 # ================= ФОНОВІ РОБІТНИКИ =================
 async def ticket_worker(bot_instance: Bot):
-    """Фоновий процес для розсилки та видалення квитків"""
     while True:
         try:
             now_ts = int(datetime.now().timestamp())
@@ -106,13 +108,11 @@ async def ticket_worker(bot_instance: Bot):
                 await db.commit()
         except Exception as e:
             logging.error(f"Помилка у ticket_worker: {e}")
-
         await asyncio.sleep(20)
 
 async def schedule_update_worker(bot_instance: Bot):
-    """Фоновий процес для моніторингу змін у розкладі кожні 5 хвилин"""
     while True:
-        await asyncio.sleep(300) # 5 хвилин
+        await asyncio.sleep(300)
         try:
             today = datetime.now(timezone.utc).astimezone().date()
             dates_to_check = {today.isoformat(), (today + timedelta(days=1)).isoformat()}
@@ -127,7 +127,6 @@ async def schedule_update_worker(bot_instance: Bot):
                         loop.run_in_executor(None, fetch_trains, target_date, "to_vns")
                     )
 
-                    # Маппінг актуального часу для кожного потяга
                     train_updates = {}
                     for r in routes_to_umea + routes_to_vns:
                         train_updates[r["id"]] = int(r["dep_time"].timestamp())
@@ -137,14 +136,10 @@ async def schedule_update_worker(bot_instance: Bot):
 
                     for b_rowid, t_id, u_id, old_dep_ts in bookings:
                         new_dep_ts = train_updates.get(t_id)
-                        
-                        # Якщо розклад змістився
                         if new_dep_ts and new_dep_ts != old_dep_ts:
                             await db.execute("UPDATE bookings SET dep_ts = ? WHERE rowid = ?", (new_dep_ts, b_rowid))
-                            
                             old_time_str = datetime.fromtimestamp(old_dep_ts).astimezone().strftime("%H:%M")
                             new_time_str = datetime.fromtimestamp(new_dep_ts).astimezone().strftime("%H:%M")
-                            
                             try:
                                 await bot_instance.send_message(
                                     u_id,
@@ -156,7 +151,6 @@ async def schedule_update_worker(bot_instance: Bot):
 
                     await db.commit()
 
-                    # Оновлюємо візуальне відображення для всіх відкритих клавіатур
                     for cache_key in list(active_messages.keys()):
                         if cache_key[0] == date_str:
                             route_id = cache_key[1]
@@ -226,7 +220,8 @@ def fetch_trains(target_date: datetime.date, direction: str):
 def get_main_keyboard():
     kb = [
         [KeyboardButton(text="Розклад на Сьогодні"), KeyboardButton(text="Розклад на Завтра")],
-        [KeyboardButton(text="👥 Мої групи"), KeyboardButton(text="🎫 Мої квитки")]
+        [KeyboardButton(text="👥 Мої групи"), KeyboardButton(text="🎫 Мої квитки")],
+        [KeyboardButton(text="⚙️ Налаштування")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -304,17 +299,19 @@ async def send_groups_list(chat_id: int, user_id: int):
         text += f"🔹 **{rname}**\n🎫 Дійсних квитків: {valid_tickets}\n👤 Учасники: {', '.join(members)}\n🔗 Запросити: `{invite_link}`\n\n"
         
         if owner_id == user_id:
+            # Власник може редагувати назву, учасників та видаляти
             kb_builder.append([
-                InlineKeyboardButton(text=f"⚙️ Учасники «{rname[:10]}»", callback_data=f"manage_grp:{rid}"),
-                InlineKeyboardButton(text=f"🗑 Видалити «{rname[:10]}»", callback_data=f"del_grp:{rid}")
+                InlineKeyboardButton(text=f"⚙️ Учасники", callback_data=f"manage_grp:{rid}"),
+                InlineKeyboardButton(text=f"✏️ Назва", callback_data=f"rename_grp:{rid}")
             ])
+            kb_builder.append([InlineKeyboardButton(text=f"🗑 Видалити «{rname[:10]}»", callback_data=f"del_grp:{rid}")])
         else:
             kb_builder.append([InlineKeyboardButton(text=f"🚪 Вийти з «{rname[:15]}»", callback_data=f"leave_grp:{rid}")])
 
     kb_builder.append([InlineKeyboardButton(text="➕ Створити нову групу", callback_data="create_group")])
     await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_builder))
 
-# ================= ОБРОБНИКИ: ПРОФІЛЬ ТА ГРУПИ =================
+# ================= ОБРОБНИКИ: ПРОФІЛЬ ТА НАЛАШТУВАННЯ =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -333,6 +330,31 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         await db.commit()
     await message.answer(f"Привіт, {full_name}.\nОбирай дію в меню:", reply_markup=get_main_keyboard())
 
+@dp.message(F.text == "⚙️ Налаштування")
+async def settings_handler(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT full_name FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+            name = (await cursor.fetchone())[0]
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Змінити моє ім'я", callback_data="change_my_name")]])
+    await message.answer(f"👤 Твій профіль:\n**Ім'я:** {name}", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "change_my_name")
+async def change_name_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи нове ім'я (до 30 символів):")
+    await state.set_state(BotState.waiting_for_user_name)
+    await callback.answer()
+
+@dp.message(BotState.waiting_for_user_name)
+async def process_new_user_name(message: Message, state: FSMContext):
+    new_name = message.text.strip()[:30]
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET full_name = ? WHERE user_id = ?", (new_name, message.from_user.id))
+        await db.commit()
+    await message.answer(f"✅ Ім'я успішно змінено на **{new_name}**!", parse_mode="Markdown")
+    await state.clear()
+
+# ================= ОБРОБНИКИ: ГРУПИ =================
 @dp.message(F.text == "👥 Мої групи")
 async def my_groups_handler(message: Message):
     await send_groups_list(message.chat.id, message.from_user.id)
@@ -349,6 +371,34 @@ async def create_group_callback(callback: CallbackQuery):
     await callback.answer("✅ Нову групу створено!")
     await callback.message.delete()
     await send_groups_list(callback.message.chat.id, callback.from_user.id)
+
+@dp.callback_query(F.data.startswith("rename_grp:"))
+async def rename_group_callback(callback: CallbackQuery, state: FSMContext):
+    route_id = int(callback.data.split(":")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT owner_id FROM routes WHERE route_id = ?", (route_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] != callback.from_user.id:
+                return await callback.answer("Тільки власник може змінити назву!", show_alert=True)
+                
+    await state.update_data(rename_route_id=route_id)
+    await callback.message.answer("Введи нову назву для групи (до 30 символів):")
+    await state.set_state(BotState.waiting_for_group_name)
+    await callback.answer()
+
+@dp.message(BotState.waiting_for_group_name)
+async def process_new_group_name(message: Message, state: FSMContext):
+    new_name = message.text.strip()[:30]
+    data = await state.get_data()
+    route_id = data.get("rename_route_id")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE routes SET name = ? WHERE route_id = ? AND owner_id = ?", (new_name, route_id, message.from_user.id))
+        await db.commit()
+        
+    await message.answer(f"✅ Назву групи змінено на **{new_name}**!", parse_mode="Markdown")
+    await state.clear()
+    await send_groups_list(message.chat.id, message.from_user.id)
 
 @dp.callback_query(F.data.startswith("manage_grp:"))
 async def manage_group_callback(callback: CallbackQuery):
@@ -480,10 +530,10 @@ async def add_tkt_callback(callback: CallbackQuery, state: FSMContext):
     route_id = int(callback.data.split(":")[1])
     await state.update_data(route_id=route_id)
     await callback.message.answer("📸 Надішли мені **ФОТО (скріншот) QR-коду** для цієї групи:")
-    await state.set_state(TicketState.waiting_for_photo)
+    await state.set_state(BotState.waiting_for_photo)
     await callback.answer()
 
-@dp.message(TicketState.waiting_for_photo, F.photo)
+@dp.message(BotState.waiting_for_photo, F.photo)
 async def process_ticket_photo(message: Message, state: FSMContext):
     file_id = message.photo[-1].file_id 
     loading_msg = await message.answer("⬇️ Завантажую зображення в базу...")
@@ -494,9 +544,9 @@ async def process_ticket_photo(message: Message, state: FSMContext):
     
     await state.update_data(image_data=img_bytes.getvalue())
     await loading_msg.edit_text("✅ QR-код збережено.\nТепер напиши дату його закінчення у форматі РРРР-ММ-ДД (наприклад, 2026-04-15):")
-    await state.set_state(TicketState.waiting_for_date)
+    await state.set_state(BotState.waiting_for_date)
 
-@dp.message(TicketState.waiting_for_date)
+@dp.message(BotState.waiting_for_date)
 async def process_ticket_date(message: Message, state: FSMContext):
     date_str = message.text.strip()
     try:
