@@ -588,24 +588,27 @@ async def handle_schedule_request(message: Message):
     )
     
     chat_id = message.chat.id
-    if chat_id in last_user_messages:
-        for msg_id in last_user_messages[chat_id]:
+    user_msg_key = (chat_id, date_str)
+
+    # Очищуємо ТІЛЬКИ старі розклади на запитувану дату, щоб "Сьогодні" і "Завтра" могли бути відкриті одночасно
+    if user_msg_key in last_user_messages:
+        for msg_id in last_user_messages[user_msg_key]:
             try: await bot.delete_message(chat_id, msg_id)
             except: pass
-    last_user_messages[chat_id] = []
+    last_user_messages[user_msg_key] = []
     
     await loading_msg.delete()
 
     if not routes_to_umea and not routes_to_vns: 
         msg = await message.answer("Не знайдено рейсів на цей день.")
-        last_user_messages[chat_id].append(msg.message_id)
+        last_user_messages[user_msg_key].append(msg.message_id)
         return
         
     for rid, rname in user_routes:
         markup = await build_dual_schedule_keyboard(routes_to_umea, routes_to_vns, date_str, rid)
         msg = await message.answer(f"⚡ Розклад", reply_markup=markup)
         
-        last_user_messages[chat_id].append(msg.message_id)
+        last_user_messages[user_msg_key].append(msg.message_id)
         cache_key = (date_str, rid)
         if cache_key not in active_messages: active_messages[cache_key] = set()
         active_messages[cache_key].add((msg.chat.id, msg.message_id))
