@@ -31,7 +31,7 @@ last_user_messages = {}
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Розширена машина станів
+# Спільна машина станів для всього бота
 class BotState(StatesGroup):
     waiting_for_photo = State()
     waiting_for_date = State()
@@ -168,7 +168,6 @@ async def schedule_update_worker(bot_instance: Bot):
         except Exception as e:
             logging.error(f"Помилка в schedule_update_worker: {e}")
 
-
 # ================= ЛОГІКА API Trafikverket =================
 def fetch_trains(target_date: datetime.date, direction: str):
     start_dt = datetime.combine(target_date, dt_time.min).astimezone(timezone.utc).isoformat()
@@ -299,7 +298,6 @@ async def send_groups_list(chat_id: int, user_id: int):
         text += f"🔹 **{rname}**\n🎫 Дійсних квитків: {valid_tickets}\n👤 Учасники: {', '.join(members)}\n🔗 Запросити: `{invite_link}`\n\n"
         
         if owner_id == user_id:
-            # Власник може редагувати назву, учасників та видаляти
             kb_builder.append([
                 InlineKeyboardButton(text=f"⚙️ Учасники", callback_data=f"manage_grp:{rid}"),
                 InlineKeyboardButton(text=f"✏️ Назва", callback_data=f"rename_grp:{rid}")
@@ -530,10 +528,10 @@ async def add_tkt_callback(callback: CallbackQuery, state: FSMContext):
     route_id = int(callback.data.split(":")[1])
     await state.update_data(route_id=route_id)
     await callback.message.answer("📸 Надішли мені **ФОТО (скріншот) QR-коду** для цієї групи:")
-    await state.set_state(TicketState.waiting_for_photo)
+    await state.set_state(BotState.waiting_for_photo)
     await callback.answer()
 
-@dp.message(TicketState.waiting_for_photo, F.photo)
+@dp.message(BotState.waiting_for_photo, F.photo)
 async def process_ticket_photo(message: Message, state: FSMContext):
     file_id = message.photo[-1].file_id 
     loading_msg = await message.answer("⬇️ Завантажую зображення в базу...")
@@ -544,9 +542,9 @@ async def process_ticket_photo(message: Message, state: FSMContext):
     
     await state.update_data(image_data=img_bytes.getvalue())
     await loading_msg.edit_text("✅ QR-код збережено.\nТепер напиши дату його закінчення у форматі РРРР-ММ-ДД (наприклад, 2026-04-15):")
-    await state.set_state(TicketState.waiting_for_date)
+    await state.set_state(BotState.waiting_for_date)
 
-@dp.message(TicketState.waiting_for_date)
+@dp.message(BotState.waiting_for_date)
 async def process_ticket_date(message: Message, state: FSMContext):
     date_str = message.text.strip()
     try:
@@ -590,7 +588,6 @@ async def handle_schedule_request(message: Message):
     chat_id = message.chat.id
     user_msg_key = (chat_id, date_str)
 
-    # Очищуємо ТІЛЬКИ старі розклади на запитувану дату, щоб "Сьогодні" і "Завтра" могли бути відкриті одночасно
     if user_msg_key in last_user_messages:
         for msg_id in last_user_messages[user_msg_key]:
             try: await bot.delete_message(chat_id, msg_id)
