@@ -58,6 +58,7 @@ async def get_user_routes(user_id: int):
 
 # ================= ФОНОВІ РОБІТНИКИ =================
 async def ticket_worker(bot_instance: Bot):
+    """Фоновий процес для розсилки та видалення квитків"""
     while True:
         try:
             now_ts = int(datetime.now().timestamp())
@@ -105,11 +106,13 @@ async def ticket_worker(bot_instance: Bot):
                 await db.commit()
         except Exception as e:
             logging.error(f"Помилка у ticket_worker: {e}")
+
         await asyncio.sleep(20)
 
 async def schedule_update_worker(bot_instance: Bot):
+    """Фоновий процес для моніторингу змін у розкладі кожні 5 хвилин"""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(300) # 5 хвилин
         try:
             today = datetime.now(timezone.utc).astimezone().date()
             dates_to_check = {today.isoformat(), (today + timedelta(days=1)).isoformat()}
@@ -124,6 +127,7 @@ async def schedule_update_worker(bot_instance: Bot):
                         loop.run_in_executor(None, fetch_trains, target_date, "to_vns")
                     )
 
+                    # Маппінг актуального часу для кожного потяга
                     train_updates = {}
                     for r in routes_to_umea + routes_to_vns:
                         train_updates[r["id"]] = int(r["dep_time"].timestamp())
@@ -133,10 +137,14 @@ async def schedule_update_worker(bot_instance: Bot):
 
                     for b_rowid, t_id, u_id, old_dep_ts in bookings:
                         new_dep_ts = train_updates.get(t_id)
+                        
+                        # Якщо розклад змістився
                         if new_dep_ts and new_dep_ts != old_dep_ts:
                             await db.execute("UPDATE bookings SET dep_ts = ? WHERE rowid = ?", (new_dep_ts, b_rowid))
+                            
                             old_time_str = datetime.fromtimestamp(old_dep_ts).astimezone().strftime("%H:%M")
                             new_time_str = datetime.fromtimestamp(new_dep_ts).astimezone().strftime("%H:%M")
+                            
                             try:
                                 await bot_instance.send_message(
                                     u_id,
@@ -148,6 +156,7 @@ async def schedule_update_worker(bot_instance: Bot):
 
                     await db.commit()
 
+                    # Оновлюємо візуальне відображення для всіх відкритих клавіатур
                     for cache_key in list(active_messages.keys()):
                         if cache_key[0] == date_str:
                             route_id = cache_key[1]
