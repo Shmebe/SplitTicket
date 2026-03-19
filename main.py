@@ -530,10 +530,10 @@ async def add_tkt_callback(callback: CallbackQuery, state: FSMContext):
     route_id = int(callback.data.split(":")[1])
     await state.update_data(route_id=route_id)
     await callback.message.answer("📸 Надішли мені **ФОТО (скріншот) QR-коду** для цієї групи:")
-    await state.set_state(BotState.waiting_for_photo)
+    await state.set_state(TicketState.waiting_for_photo)
     await callback.answer()
 
-@dp.message(BotState.waiting_for_photo, F.photo)
+@dp.message(TicketState.waiting_for_photo, F.photo)
 async def process_ticket_photo(message: Message, state: FSMContext):
     file_id = message.photo[-1].file_id 
     loading_msg = await message.answer("⬇️ Завантажую зображення в базу...")
@@ -544,9 +544,9 @@ async def process_ticket_photo(message: Message, state: FSMContext):
     
     await state.update_data(image_data=img_bytes.getvalue())
     await loading_msg.edit_text("✅ QR-код збережено.\nТепер напиши дату його закінчення у форматі РРРР-ММ-ДД (наприклад, 2026-04-15):")
-    await state.set_state(BotState.waiting_for_date)
+    await state.set_state(TicketState.waiting_for_date)
 
-@dp.message(BotState.waiting_for_date)
+@dp.message(TicketState.waiting_for_date)
 async def process_ticket_date(message: Message, state: FSMContext):
     date_str = message.text.strip()
     try:
