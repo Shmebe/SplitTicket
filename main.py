@@ -31,6 +31,8 @@ last_user_messages = {}
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# Розширена машина станів
+class BotState(StatesGroup):
     waiting_for_photo = State()
     waiting_for_date = State()
     waiting_for_user_name = State()
@@ -218,6 +220,8 @@ def fetch_trains(target_date: datetime.date, direction: str):
 def get_main_keyboard():
     kb = [
         [KeyboardButton(text="Розклад на Сьогодні"), KeyboardButton(text="Розклад на Завтра")],
+        [KeyboardButton(text="👥 Мої групи"), KeyboardButton(text="🎫 Мої квитки")],
+        [KeyboardButton(text="⚙️ Налаштування")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -584,27 +588,24 @@ async def handle_schedule_request(message: Message):
     )
     
     chat_id = message.chat.id
-    user_msg_key = (chat_id, date_str)
-
-    # Очищуємо ТІЛЬКИ старі розклади на запитувану дату, щоб "Сьогодні" і "Завтра" могли бути відкриті одночасно
-    if user_msg_key in last_user_messages:
-        for msg_id in last_user_messages[user_msg_key]:
+    if chat_id in last_user_messages:
+        for msg_id in last_user_messages[chat_id]:
             try: await bot.delete_message(chat_id, msg_id)
             except: pass
-    last_user_messages[user_msg_key] = []
+    last_user_messages[chat_id] = []
     
     await loading_msg.delete()
 
     if not routes_to_umea and not routes_to_vns: 
         msg = await message.answer("Не знайдено рейсів на цей день.")
-        last_user_messages[user_msg_key].append(msg.message_id)
+        last_user_messages[chat_id].append(msg.message_id)
         return
         
     for rid, rname in user_routes:
         markup = await build_dual_schedule_keyboard(routes_to_umea, routes_to_vns, date_str, rid)
         msg = await message.answer(f"⚡ Розклад", reply_markup=markup)
         
-        last_user_messages[user_msg_key].append(msg.message_id)
+        last_user_messages[chat_id].append(msg.message_id)
         cache_key = (date_str, rid)
         if cache_key not in active_messages: active_messages[cache_key] = set()
         active_messages[cache_key].add((msg.chat.id, msg.message_id))
